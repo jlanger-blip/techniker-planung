@@ -1,0 +1,599 @@
+{
+  "name": "Techniker-Planungs-Workflow",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 1
+            }
+          ]
+        }
+      },
+      "id": "trigger-schedule",
+      "name": "Stündlicher Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://sheets.googleapis.com/v4/spreadsheets/1K0vBkaeVWs8FLxNvZQ5Hckv7gFhKP1L8Wpf3EErha-U/values/Kundenliste!A:Z",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpQueryAuth",
+        "options": {}
+      },
+      "id": "load-customers",
+      "name": "1.1 Kundenliste laden",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [220, 0],
+      "credentials": {
+        "httpQueryAuth": {
+          "id": "google-sheets-api",
+          "name": "Google Sheets API Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://sheets.googleapis.com/v4/spreadsheets/1K0vBkaeVWs8FLxNvZQ5Hckv7gFhKP1L8Wpf3EErha-U/values/Techniker!A:Z",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpQueryAuth",
+        "options": {}
+      },
+      "id": "load-technicians",
+      "name": "1.2 Techniker laden",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [220, 200],
+      "credentials": {
+        "httpQueryAuth": {
+          "id": "google-sheets-api",
+          "name": "Google Sheets API Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "event",
+        "operation": "getAll",
+        "calendar": {
+          "__rl": true,
+          "value": "={{ $json.calendarId }}",
+          "mode": "id"
+        },
+        "returnAll": false,
+        "limit": 100,
+        "options": {
+          "timeMin": "={{ $now.toISO() }}",
+          "timeMax": "={{ $now.plus({ days: 14 }).toISO() }}"
+        }
+      },
+      "id": "check-calendar",
+      "name": "1.3 Kalender checken",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.1,
+      "position": [440, 100],
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "google-calendar",
+          "name": "Google Calendar"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Phase 2: Touren planen\nconst customers = $input.first().json.customers;\nconst technicians = $input.first().json.technicians;\nconst existingEvents = $input.first().json.events || [];\n\n// Arbeitszeiten\nconst WORK_START = 8; // 08:00\nconst WORK_END = 17;  // 17:00\nconst MAX_HOURS_PER_DAY = 8;\nconst APPOINTMENT_DURATION = 60; // Minuten\n\n// Startpunkt Frankfurt\nconst FRANKFURT = { lat: 50.1109, lng: 8.6821 };\n\n// Hilfsfunktion: Distanz berechnen (Haversine)\nfunction getDistance(lat1, lon1, lat2, lon2) {\n  const R = 6371;\n  const dLat = (lat2 - lat1) * Math.PI / 180;\n  const dLon = (lon2 - lon1) * Math.PI / 180;\n  const a = Math.sin(dLat/2) * Math.sin(dLat/2) +\n    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *\n    Math.sin(dLon/2) * Math.sin(dLon/2);\n  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));\n}\n\n// Hilfsfunktion: Ist Wochenende?\nfunction isWeekend(date) {\n  const day = new Date(date).getDay();\n  return day === 0 || day === 6;\n}\n\n// Hilfsfunktion: Hat Konflikt?\nfunction hasConflict(date, hour, events) {\n  const checkTime = new Date(date);\n  checkTime.setHours(hour, 0, 0, 0);\n  const checkEnd = new Date(checkTime);\n  checkEnd.setMinutes(checkEnd.getMinutes() + APPOINTMENT_DURATION);\n  \n  return events.some(event => {\n    const eventStart = new Date(event.start);\n    const eventEnd = new Date(event.end);\n    return checkTime < eventEnd && checkEnd > eventStart;\n  });\n}\n\n// Kunden nach Entfernung zu Frankfurt sortieren\nconst sortedCustomers = customers\n  .filter(c => c.status === 'offen')\n  .map(c => ({\n    ...c,\n    distance: getDistance(FRANKFURT.lat, FRANKFURT.lng, c.lat || 50.1, c.lng || 8.6)\n  }))\n  .sort((a, b) => a.distance - b.distance);\n\n// Termine verteilen\nconst plannedAppointments = [];\nlet currentDate = new Date();\ncurrentDate.setDate(currentDate.getDate() + 1); // Ab morgen planen\n\nfor (const technician of technicians) {\n  const techEvents = existingEvents.filter(e => e.technicianId === technician.id);\n  let dayHours = 0;\n  let currentHour = WORK_START;\n  \n  for (const customer of sortedCustomers.filter(c => !c.assigned)) {\n    // Nächsten verfügbaren Werktag finden\n    while (isWeekend(currentDate)) {\n      currentDate.setDate(currentDate.getDate() + 1);\n    }\n    \n    // Prüfen ob noch Zeit im Tag\n    if (dayHours >= MAX_HOURS_PER_DAY || currentHour >= WORK_END) {\n      currentDate.setDate(currentDate.getDate() + 1);\n      dayHours = 0;\n      currentHour = WORK_START;\n      continue;\n    }\n    \n    // Konfliktprüfung\n    if (hasConflict(currentDate, currentHour, techEvents)) {\n      currentHour++;\n      continue;\n    }\n    \n    // Termin planen\n    const appointmentDate = new Date(currentDate);\n    appointmentDate.setHours(currentHour, 0, 0, 0);\n    \n    plannedAppointments.push({\n      customerId: customer.id,\n      customerName: customer.name,\n      customerEmail: customer.email,\n      customerAddress: customer.address,\n      technicianId: technician.id,\n      technicianName: technician.name,\n      date: appointmentDate.toISOString(),\n      endDate: new Date(appointmentDate.getTime() + APPOINTMENT_DURATION * 60000).toISOString(),\n      status: 'blocker',\n      travelTime: Math.round(customer.distance / 60 * 60) // geschätzte Fahrzeit in Minuten\n    });\n    \n    customer.assigned = true;\n    currentHour += Math.ceil(APPOINTMENT_DURATION / 60) + 1; // +1h Puffer\n    dayHours += 2;\n  }\n}\n\nreturn plannedAppointments.map(apt => ({ json: apt }));"
+      },
+      "id": "plan-tours",
+      "name": "2.1 Touren planen",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [660, 0]
+    },
+    {
+      "parameters": {
+        "resource": "event",
+        "operation": "create",
+        "calendar": {
+          "__rl": true,
+          "value": "={{ $json.technicianCalendarId }}",
+          "mode": "id"
+        },
+        "start": "={{ $json.date }}",
+        "end": "={{ $json.endDate }}",
+        "additionalFields": {
+          "summary": "BLOCKER: {{ $json.customerName }}",
+          "description": "Geplanter Termin - Warte auf Bestätigung\nKunde: {{ $json.customerName }}\nAdresse: {{ $json.customerAddress }}",
+          "colorId": "5"
+        }
+      },
+      "id": "create-blocker",
+      "name": "2.2 Blocker setzen",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.1,
+      "position": [880, 0],
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "google-calendar",
+          "name": "Google Calendar"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "fromEmail": "chatbot@almas-industries.de",
+        "toEmail": "={{ $json.customerEmail }}",
+        "subject": "Terminvorschlag für Ihren Service-Termin",
+        "emailType": "html",
+        "message": "<!DOCTYPE html>\n<html>\n<head><style>body{font-family:Arial,sans-serif;}.btn{background:#007bff;color:white;padding:12px 24px;text-decoration:none;border-radius:4px;display:inline-block;margin:8px 4px;}.btn-success{background:#28a745;}.btn-danger{background:#dc3545;}</style></head>\n<body>\n<h2>Terminvorschlag für Ihren Service-Termin</h2>\n<p>Sehr geehrte(r) {{ $json.customerName }},</p>\n<p>wir möchten gerne einen Service-Termin mit Ihnen vereinbaren:</p>\n<div style=\"background:#f8f9fa;padding:16px;border-radius:8px;margin:16px 0;\">\n<p><strong>📅 Datum:</strong> {{ $json.date.split('T')[0] }}</p>\n<p><strong>🕐 Uhrzeit:</strong> {{ $json.date.split('T')[1].substring(0,5) }} Uhr</p>\n<p><strong>👨‍🔧 Techniker:</strong> {{ $json.technicianName }}</p>\n<p><strong>📍 Adresse:</strong> {{ $json.customerAddress }}</p>\n</div>\n<p>Bitte bestätigen Sie den Termin:</p>\n<a href=\"mailto:chatbot@almas-industries.de?subject=BESTÄTIGT: Termin {{ $json.date.split('T')[0] }}&body=Ich bestätige den Termin.\" class=\"btn btn-success\">✅ Termin bestätigen</a>\n<a href=\"mailto:chatbot@almas-industries.de?subject=ABSAGE: Termin {{ $json.date.split('T')[0] }}&body=Ich muss den Termin leider absagen.\" class=\"btn btn-danger\">❌ Termin absagen</a>\n<a href=\"mailto:chatbot@almas-industries.de?subject=ÄNDERUNG: Termin {{ $json.date.split('T')[0] }}&body=Ich würde gerne einen anderen Termin vorschlagen:\" class=\"btn\">📅 Anderen Termin vorschlagen</a>\n<p>Mit freundlichen Grüßen,<br>Ihr ALMAS Industries Team</p>\n</body>\n</html>"
+      },
+      "id": "send-email",
+      "name": "3.1 Terminanfrage senden",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [1100, 0],
+      "credentials": {
+        "smtp": {
+          "id": "smtp-almas",
+          "name": "SMTP Almas"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://sheets.googleapis.com/v4/spreadsheets/1K0vBkaeVWs8FLxNvZQ5Hckv7gFhKP1L8Wpf3EErha-U/values/Termine!A:J:append",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpQueryAuth",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "values",
+              "value": "={{ [[$json.customerId, $json.customerName, $json.technicianId, $json.technicianName, $json.date, $json.status, $json.customerEmail, new Date().toISOString()]] }}"
+            }
+          ]
+        },
+        "options": {
+          "queryParameters": {
+            "parameters": [
+              {
+                "name": "valueInputOption",
+                "value": "RAW"
+              }
+            ]
+          }
+        }
+      },
+      "id": "save-status",
+      "name": "3.2 Status speichern",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1320, 0],
+      "credentials": {
+        "httpQueryAuth": {
+          "id": "google-sheets-api",
+          "name": "Google Sheets API Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 15
+            }
+          ]
+        }
+      },
+      "id": "trigger-email-check",
+      "name": "Email-Check Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [0, 400]
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "folder": "INBOX",
+        "filters": {
+          "unread": true,
+          "sender": ""
+        },
+        "options": {
+          "limit": 50
+        }
+      },
+      "id": "check-emails",
+      "name": "4.1 Emails checken",
+      "type": "n8n-nodes-base.emailReadImap",
+      "typeVersion": 2,
+      "position": [220, 400],
+      "credentials": {
+        "imap": {
+          "id": "imap-almas",
+          "name": "IMAP Almas Chatbot"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Phase 4: Antworten verarbeiten\nconst emails = $input.all();\nconst responses = [];\n\nfor (const email of emails) {\n  const subject = email.json.subject || '';\n  const body = email.json.text || email.json.html || '';\n  const from = email.json.from || '';\n  \n  let status = 'unbekannt';\n  let action = 'manual_review';\n  \n  // Betreff analysieren\n  const subjectUpper = subject.toUpperCase();\n  \n  if (subjectUpper.includes('BESTÄTIGT') || subjectUpper.includes('CONFIRMED') || subjectUpper.includes('JA')) {\n    status = 'bestätigt';\n    action = 'convert_to_appointment';\n  } else if (subjectUpper.includes('ABSAGE') || subjectUpper.includes('CANCEL') || subjectUpper.includes('NEIN')) {\n    status = 'abgesagt';\n    action = 'delete_blocker_replan';\n  } else if (subjectUpper.includes('ÄNDERUNG') || subjectUpper.includes('CHANGE') || subjectUpper.includes('VERSCHIEBEN')) {\n    status = 'änderung_gewünscht';\n    action = 'extract_new_time';\n    \n    // Versuche neuen Zeitpunkt zu extrahieren\n    const timeMatch = body.match(/(\\d{1,2}[:\\.\\s]?\\d{0,2})\\s*(Uhr|h)?/i);\n    const dateMatch = body.match(/(\\d{1,2})[\\.\\/\\-](\\d{1,2})[\\.\\/\\-]?(\\d{2,4})?/i);\n    \n    if (timeMatch) {\n      email.json.suggestedTime = timeMatch[1];\n    }\n    if (dateMatch) {\n      email.json.suggestedDate = `${dateMatch[1]}.${dateMatch[2]}.${dateMatch[3] || new Date().getFullYear()}`;\n    }\n  }\n  \n  // Termin-Referenz aus Subject extrahieren\n  const dateMatch = subject.match(/Termin\\s+(\\d{4}-\\d{2}-\\d{2})/i);\n  \n  responses.push({\n    json: {\n      emailId: email.json.id,\n      from: from,\n      subject: subject,\n      status: status,\n      action: action,\n      originalDate: dateMatch ? dateMatch[1] : null,\n      suggestedTime: email.json.suggestedTime,\n      suggestedDate: email.json.suggestedDate,\n      processedAt: new Date().toISOString()\n    }\n  });\n}\n\nreturn responses;"
+      },
+      "id": "parse-responses",
+      "name": "4.2 Antworten parsen",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 400]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false
+          },
+          "conditions": [
+            {
+              "id": "confirmed",
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "bestätigt",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "or"
+        }
+      },
+      "id": "switch-response",
+      "name": "4.3 Nach Status verzweigen",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [660, 400]
+    },
+    {
+      "parameters": {
+        "resource": "event",
+        "operation": "update",
+        "calendar": {
+          "__rl": true,
+          "value": "={{ $json.calendarId }}",
+          "mode": "id"
+        },
+        "eventId": "={{ $json.eventId }}",
+        "updateFields": {
+          "summary": "BESTÄTIGT: {{ $json.customerName }}",
+          "colorId": "10",
+          "description": "Bestätigter Termin\nKunde: {{ $json.customerName }}\nAdresse: {{ $json.customerAddress }}\nBestätigt am: {{ $now.toISO() }}"
+        }
+      },
+      "id": "confirm-appointment",
+      "name": "4.4a Termin bestätigen",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.1,
+      "position": [880, 300],
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "google-calendar",
+          "name": "Google Calendar"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "event",
+        "operation": "delete",
+        "calendar": {
+          "__rl": true,
+          "value": "={{ $json.calendarId }}",
+          "mode": "id"
+        },
+        "eventId": "={{ $json.eventId }}"
+      },
+      "id": "delete-blocker",
+      "name": "4.4b Blocker löschen",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.1,
+      "position": [880, 500],
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "google-calendar",
+          "name": "Google Calendar"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://sheets.googleapis.com/v4/spreadsheets/1K0vBkaeVWs8FLxNvZQ5Hckv7gFhKP1L8Wpf3EErha-U/values/Termine!A:J:append",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpQueryAuth",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "values",
+              "value": "={{ [[$json.customerId, $json.customerName, $json.technicianId, $json.technicianName, $json.date, $json.status, $json.customerEmail, new Date().toISOString()]] }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "update-sheet-status",
+      "name": "5.1 Sheet aktualisieren",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1100, 400],
+      "credentials": {
+        "httpQueryAuth": {
+          "id": "google-sheets-api",
+          "name": "Google Sheets API Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.WEBHOOK_NOTIFICATION_URL }}",
+        "method": "POST",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "type",
+              "value": "appointment_update"
+            },
+            {
+              "name": "data",
+              "value": "={{ JSON.stringify($json) }}"
+            }
+          ]
+        }
+      },
+      "id": "send-notification",
+      "name": "5.2 Benachrichtigung senden",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1320, 400]
+    },
+    {
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "techniker-status",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-status",
+      "name": "API: Status abrufen",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1.1,
+      "position": [0, 700],
+      "webhookId": "techniker-status"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "techniker-start",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-start",
+      "name": "API: Workflow starten",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1.1,
+      "position": [0, 900],
+      "webhookId": "techniker-start"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { success: true, appointments: $json.appointments, lastRun: $now.toISO() } }}"
+      },
+      "id": "respond-status",
+      "name": "Status Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [440, 700]
+    }
+  ],
+  "connections": {
+    "Stündlicher Trigger": {
+      "main": [
+        [
+          {
+            "node": "1.1 Kundenliste laden",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "1.2 Techniker laden",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "1.1 Kundenliste laden": {
+      "main": [
+        [
+          {
+            "node": "1.3 Kalender checken",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "1.2 Techniker laden": {
+      "main": [
+        [
+          {
+            "node": "1.3 Kalender checken",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "1.3 Kalender checken": {
+      "main": [
+        [
+          {
+            "node": "2.1 Touren planen",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "2.1 Touren planen": {
+      "main": [
+        [
+          {
+            "node": "2.2 Blocker setzen",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "2.2 Blocker setzen": {
+      "main": [
+        [
+          {
+            "node": "3.1 Terminanfrage senden",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "3.1 Terminanfrage senden": {
+      "main": [
+        [
+          {
+            "node": "3.2 Status speichern",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email-Check Trigger": {
+      "main": [
+        [
+          {
+            "node": "4.1 Emails checken",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "4.1 Emails checken": {
+      "main": [
+        [
+          {
+            "node": "4.2 Antworten parsen",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "4.2 Antworten parsen": {
+      "main": [
+        [
+          {
+            "node": "4.3 Nach Status verzweigen",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "4.3 Nach Status verzweigen": {
+      "main": [
+        [
+          {
+            "node": "4.4a Termin bestätigen",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "4.4b Blocker löschen",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "4.4a Termin bestätigen": {
+      "main": [
+        [
+          {
+            "node": "5.1 Sheet aktualisieren",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "4.4b Blocker löschen": {
+      "main": [
+        [
+          {
+            "node": "5.1 Sheet aktualisieren",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "5.1 Sheet aktualisieren": {
+      "main": [
+        [
+          {
+            "node": "5.2 Benachrichtigung senden",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "API: Status abrufen": {
+      "main": [
+        [
+          {
+            "node": "Status Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveExecutionProgress": true
+  },
+  "staticData": null,
+  "tags": [
+    {
+      "name": "Techniker-Planung"
+    }
+  ],
+  "pinData": {},
+  "versionId": "1.0.0"
+}
