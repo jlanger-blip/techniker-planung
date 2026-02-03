@@ -1,4 +1,4 @@
-import { MapPin, Clock, Calendar, Navigation } from 'lucide-react';
+import { Clock, Calendar, Navigation } from 'lucide-react';
 import type { Appointment, Technician } from '../types';
 
 interface TechnicianCardProps {

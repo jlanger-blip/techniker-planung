@@ -1,5 +1,5 @@
-import { useState, useEffect } from 'react';
-import { Calendar, Users, Mail, Play, Pause, RefreshCw, MapPin, Clock, CheckCircle, XCircle, AlertCircle } from 'lucide-react';
+import { useState } from 'react';
+import { Calendar, Users, Mail, Play, Pause, RefreshCw, AlertCircle } from 'lucide-react';
 import type { Appointment, Technician, EmailQueueItem, WorkflowStatus } from './types';
 import WeekView from './components/WeekView';
 import StatusOverview from './components/StatusOverview';
@@ -75,7 +75,7 @@ const demoEmailQueue: EmailQueueItem[] = [
 ];
 
 function App() {
-  const [appointments, setAppointments] = useState<Appointment[]>(demoAppointments);
+  const [appointments] = useState<Appointment[]>(demoAppointments);
   const [technicians] = useState<Technician[]>(demoTechnicians);
   const [emailQueue] = useState<EmailQueueItem[]>(demoEmailQueue);
   const [workflowStatus, setWorkflowStatus] = useState<WorkflowStatus>({
